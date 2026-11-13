@@ -43,3 +43,23 @@ def test_teacher_only_page_refused_for_student(api, users):
         app.router.routes = [
             route for route in app.router.routes if getattr(route, "path", None) != "/api/teacher-only-test"
         ]
+
+
+def test_students_list_scoped_by_role(api, users):
+    s1_id, s2_id = users
+    login(api, "s1", JUDGE_PASSWORDS["s1"])
+    assert [s["id"] for s in api.get("/api/students").json()] == [s1_id]
+
+    login(api, "guardian", JUDGE_PASSWORDS["guardian"])
+    assert [s["id"] for s in api.get("/api/students").json()] == [s1_id]
+
+    login(api, "admin", JUDGE_PASSWORDS["admin"])
+    assert sorted(s["id"] for s in api.get("/api/students").json()) == sorted([s1_id, s2_id])
+
+    names = {s["name"] for s in api.get("/api/students").json()}
+    assert names == {"Student 1", "Student 2"}
+
+
+def test_students_list_needs_login(api, users):
+    api.cookies.clear()
+    assert api.get("/api/students").status_code == 401

@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -6,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Base
 
-TEST_URL = "postgresql+psycopg://fastrobox@127.0.0.1:54329/fastrobox_test"
+TEST_URL = os.environ.get("TEST_DATABASE_URL", "postgresql+psycopg://fastrobox@127.0.0.1:54329/fastrobox_test")
 
 
 class FakeClock:

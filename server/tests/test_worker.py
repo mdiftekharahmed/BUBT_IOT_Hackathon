@@ -20,15 +20,17 @@ def device(db, clock):
     return dev
 
 
-def test_device_goes_offline_after_30s(db, clock, device):
+def test_device_goes_offline_well_inside_30s(db, clock, device):
+    """Paper: offline within 30 s of going silent. The mark is made at 20 s so the
+    sweep period and the dashboard refresh still fit inside the limit."""
     sent = []
     notifier = lambda *a: sent.append(a)
 
-    clock.advance(29)
+    clock.advance(19)  # three missed 5 s records are tolerated
     assert sweep_offline(db, clock, notifier=notifier) == []
     assert device.online is True
 
-    clock.advance(2)  # 31 s of silence
+    clock.advance(2)  # 21 s of silence
     assert sweep_offline(db, clock, notifier=notifier) == ["T17-D1"]
     db.refresh(device)
     assert device.online is False

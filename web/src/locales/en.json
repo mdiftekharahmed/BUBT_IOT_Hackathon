@@ -9,6 +9,13 @@
     "locked": "Too many attempts — locked. Try again in {{seconds}} s"
   },
   "home": { "title": "Rooms", "none": "No rooms to show" },
+  "students": {
+    "title": "Attendance",
+    "none": "No attendance records yet",
+    "not_allowed": "Not allowed",
+    "not_found": "No such student",
+    "error": "Could not load attendance"
+  },
   "room": {
     "status": "Status",
     "temp_c": "Temperature (°C)",

@@ -88,10 +88,38 @@ def test_missing_field_422_names_the_field(client):
     assert "status" in r.text
 
 
-def test_wrong_room_for_device_rejected(client, db):
-    r = _post(client, "telemetry", _record(1, room_id="R-306"))
+def test_new_room_id_moves_device(client, db):
+    """The judge types the Room ID on the device's setup page: the device's room follows it."""
+    r = _post(client, "telemetry", _record(1, room_id="R-412"))
+    assert r.status_code == 200
+    assert db.get(Room, "R-412") is not None
+    assert db.get(Device, "T17-D1").room_id == "R-412"
+    assert db.scalar(select(Telemetry.room_id)) == "R-412"
+
+
+def test_room_move_keeps_teacher_access(client, db):
+    from app.models import RoomTeacher, User
+    teacher = User(username="t-move", password_hash="x", role="teacher")
+    db.add(teacher)
+    db.flush()
+    db.add(RoomTeacher(room_id="R-305", user_id=teacher.id))
+    db.flush()
+    assert _post(client, "telemetry", _record(1, room_id="R-412")).status_code == 200
+    assert db.query(RoomTeacher).filter_by(room_id="R-412", user_id=teacher.id).one_or_none() is not None
+
+
+def test_bad_room_id_rejected(client, db):
+    r = _post(client, "telemetry", _record(1, room_id="R 412"))
     assert r.status_code == 422
+    assert "invalid room_id" in r.text
     assert _count(db, Telemetry) == 0
+    assert db.get(Device, "T17-D1").room_id == "R-305"
+
+
+def test_room_switch_keeps_seq_unique(client, db):
+    assert _post(client, "telemetry", _record(5)).status_code == 200
+    assert _post(client, "telemetry", _record(5, room_id="R-412")).status_code == 409
+    assert _count(db, Telemetry) == 1
 
 
 def test_bad_clock_sets_ts_suspect(client, db):
