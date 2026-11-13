@@ -1,5 +1,7 @@
 pyproject.toml
 app/__init__.py
+app/config.py
+app/main.py
 fastrobox_server.egg-info/PKG-INFO
 fastrobox_server.egg-info/SOURCES.txt
 fastrobox_server.egg-info/dependency_links.txt
