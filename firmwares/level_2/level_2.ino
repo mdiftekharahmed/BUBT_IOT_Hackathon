@@ -597,6 +597,8 @@ static uint8_t  gAttempt = 0;
 static bool     gTrying = false;
 static uint16_t gDiscAtTry = 0;
 static uint32_t gScanAtMs = 0;
+static bool     gConnPending = false;   // a WiFi.begin() is due (waits for a running scan to finish)
+static uint8_t  gFatalCount = 0;        // "wrong password / not found" results in a row
 
 static void onWifiDisconnected(WiFiEvent_t, WiFiEventInfo_t info) {
   int r = info.wifi_sta_disconnected.reason;
@@ -632,10 +634,12 @@ static void enterSetup() {
   logLine("[NET] setup mode: access point %s password=%s page=http://192.168.4.1", AP_SSID, gApPass);
 }
 
+// Starts a connection. The actual WiFi.begin() is issued by netTask (see NET_CONNECTING): it must
+// not run while a network scan is in progress, and it is repeated until the attempt window ends.
 static void startConnect(const NetConfig& c) {
   gLastDiscReason = 0;
-  gDiscAtTry = gDiscCount;
-  WiFi.begin(c.ssid, c.pass[0] ? c.pass : nullptr);
+  gFatalCount = 0;
+  gConnPending = true;
   gConnectStartMs = millis();
   gNet = NET_CONNECTING;
   logLine("[NET] connecting to \"%s\"", c.ssid);
@@ -668,8 +672,10 @@ static void onConnected(bool wasReconnect) {
 
 static void setupFailed(int reason, bool timedOut) {
   NetConfig c = cfgCopy();
-  const char* why = timedOut && !reasonIsFatal(reason) ? "No answer within 15 s" : reasonText(reason);
-  snprintf(gSetupError, sizeof gSetupError, "%s (\"%s\")", why, c.ssid);
+  if (timedOut && !reasonIsFatal(reason))
+    snprintf(gSetupError, sizeof gSetupError, "No answer within 15 s (\"%s\", last reason %d)", c.ssid, reason);
+  else
+    snprintf(gSetupError, sizeof gSetupError, "%s (\"%s\")", reasonText(reason), c.ssid);
   logLine("[NET] setup error: %s", gSetupError);
   WiFi.disconnect(false);              // stop the station; the access point stays up
   enterSetup();
@@ -734,11 +740,33 @@ static void netTask(void*) {
       case NET_CONNECTING: {
         if (WiFi.status() == WL_CONNECTED) { onConnected(false); break; }
         NetConfig c = cfgCopy();
+
+        if (gConnPending) {
+          // Never call WiFi.begin() during a scan: the request is silently dropped.
+          if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+            WiFi.scanDelete();
+            gDiscAtTry = gDiscCount;
+            WiFi.begin(c.ssid, c.pass[0] ? c.pass : nullptr);
+            gTryStartMs = now;
+            gConnPending = false;
+          }
+        } else if (gDiscCount != gDiscAtTry) {
+          // This attempt ended. One refusal can be a hiccup, so "wrong password / not found"
+          // needs two in a row; anything else is simply tried again.
+          if (reasonIsFatal(gLastDiscReason)) gFatalCount++; else gFatalCount = 0;
+          if (!c.verified && gFatalCount >= 2) { setupFailed(gLastDiscReason, false); break; }
+          logLine("[NET] attempt failed (reason %d), trying again", gLastDiscReason);
+          gConnPending = true;
+        } else if (now - gTryStartMs > 6000) {
+          logLine("[NET] no answer yet, trying again");
+          WiFi.disconnect(false);
+          gConnPending = true;
+        }
+
+        if (gNet != NET_CONNECTING) break;
         if (!c.verified) {
-          // New details: wrong password / missing network -> back to setup within 15 s
-          bool failedEvent = gDiscCount != gDiscAtTry && reasonIsFatal(gLastDiscReason);
-          bool timedOut = now - gConnectStartMs > SETUP_FAIL_MS;
-          if (failedEvent || timedOut) setupFailed(gLastDiscReason, timedOut);
+          // New details that do not connect -> back to setup within 15 s
+          if (now - gConnectStartMs > SETUP_FAIL_MS) setupFailed(gLastDiscReason, true);
         } else if (now - gConnectStartMs > RECONNECT_TRY_MS) {
           // Known-good details (e.g. after a power cut): keep retrying, never back to setup
           logLine("[NET] \"%s\" not reachable yet, retrying", c.ssid);
