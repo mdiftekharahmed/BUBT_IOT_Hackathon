@@ -2,18 +2,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from app.clock import Clock
+from app.clock import Clock, get_clock  # noqa: F401  (get_clock re-exported; overridden in tests)
 from app.db import get_db
 from app.models import Device
 from app.security import token_matches
 from app.services.ingest import IngestResult, validate_and_store
 
 router = APIRouter(prefix="/api/device", tags=["device"])
-
-
-def get_clock() -> Clock:
-    from app.clock import SystemClock
-    return SystemClock()
 
 
 def current_device(
