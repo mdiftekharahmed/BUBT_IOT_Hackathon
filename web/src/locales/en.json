@@ -1,0 +1,54 @@
+{
+  "app": { "title": "FastRobox" },
+  "nav": { "home": "Home", "health": "Device health", "logins": "Login history", "logout": "Log out" },
+  "login": {
+    "username": "Username",
+    "password": "Password",
+    "submit": "Log in",
+    "invalid": "Wrong username or password",
+    "locked": "Too many attempts — locked. Try again in {{seconds}} s"
+  },
+  "home": { "title": "Rooms", "none": "No rooms to show" },
+  "room": {
+    "status": "Status",
+    "temp_c": "Temperature (°C)",
+    "rh": "Humidity (%)",
+    "heat_index_c": "Heat index (°C)",
+    "heat_trend": "Heat trend",
+    "door": "Door",
+    "flame": "Flame",
+    "online": "Online",
+    "online_yes": "online",
+    "online_no": "offline",
+    "connected": "Live",
+    "disconnected": "Reconnecting…",
+    "reset_fire": "Reset fire",
+    "reset_ok": "Reset command sent",
+    "reset_offline": "Device offline — cannot reset",
+    "events": "Recent events",
+    "no_events": "No events yet",
+    "fire_latch": "FIRE alarm active"
+  },
+  "health": {
+    "title": "Device health",
+    "uptime_s": "Uptime (s)",
+    "rssi": "Wi-Fi (dBm)",
+    "heap_kb": "Free heap (kB)",
+    "chip_temp_c": "Chip temp (°C)",
+    "fw": "Firmware",
+    "reset_reason": "Reset reason",
+    "last_seen_at": "Last seen"
+  },
+  "admin": {
+    "title": "Login history",
+    "only": "Admins only",
+    "time": "Time",
+    "user": "User",
+    "success": "Success",
+    "failed": "Failed"
+  },
+  "alert": { "FIRE": "FIRE in room {{room}}", "PANIC": "PANIC in room {{room}}" },
+  "status": { "SAFE": "SAFE", "WARNING": "WARNING", "DANGER": "DANGER" },
+  "trend": { "FALLING": "FALLING", "STEADY": "STEADY", "RISING": "RISING" },
+  "lang": { "en": "English", "bn": "বাংলা" }
+}

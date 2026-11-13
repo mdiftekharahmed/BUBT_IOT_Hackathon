@@ -40,7 +40,7 @@ def upgrade() -> None:
     sa.Column('password_hash', sa.String(length=255), nullable=False),
     sa.Column('role', sa.String(length=16), nullable=False),
     sa.Column('locked_until', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('failed_attempts', sa.Integer(), nullable=False),
+    sa.Column('failed_attempts', sa.Integer(), nullable=False, server_default='0'),
     sa.Column('telegram_chat_id', sa.String(length=32), nullable=True),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('username')

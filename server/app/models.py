@@ -21,7 +21,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(16))  # admin | teacher | student | guardian
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     telegram_chat_id: Mapped[str | None] = mapped_column(String(32))
 
 
@@ -115,6 +115,15 @@ class AlertSent(Base):
     channel: Mapped[str] = mapped_column(String(16))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(String(256))
+
+
+class SessionRow(Base):
+    __tablename__ = "sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=_now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Attendance(Base):

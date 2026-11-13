@@ -19,6 +19,36 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
 
+  worker:
+    build: ../server
+    command: python -m app.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://fastrobox:${POSTGRES_PASSWORD}@postgres:5432/fastrobox
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  test-postgres:
+    image: postgres:16-alpine
+    profiles: [test]
+    environment:
+      POSTGRES_USER: fastrobox
+      POSTGRES_DB: fastrobox_test
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ["54329:5432"]
+
+  simulator:
+    build: ../simulator
+    profiles: [sim]
+    environment:
+      DEVICE_TOKEN: ${DEVICE_TOKEN:?run server/seed.py or dev_seed.py first}
+      DEVICE_ID: T17-D1
+      ROOM_ID: R-305
+    command: >
+      python simulate.py --base http://web
+      --scenario ${SIM_SCENARIO:-normal} --count 6 --interval 5
+    depends_on: [web]
+
   web:
     build:
       context: ..

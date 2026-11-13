@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -98,6 +99,33 @@ class Device:
             self.send("events", self.event("STATUS", f"{self.status}->{new}"))
             self.status = new
         self.send("telemetry", self.telemetry(temp, rh))
+
+
+def command_listener(base: str, token: str, stop: "threading.Event") -> None:
+    """Connect to WS /api/device/ws, print every server command and ack it.
+
+    This is how `Reset fire` and later settings/OTA commands are rehearsed
+    end to end without the real board.
+    """
+    from websockets.sync.client import connect
+
+    url = base.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/api/device/ws"
+    while not stop.is_set():
+        try:
+            with connect(url, additional_headers={"Authorization": f"Bearer {token}"}, open_timeout=5) as ws:
+                print("  [ws] connected to /api/device/ws")
+                while not stop.is_set():
+                    try:
+                        raw = ws.recv(timeout=1)
+                    except TimeoutError:
+                        continue
+                    msg = json.loads(raw)
+                    print(f"  [ws] cmd: {json.dumps(msg)}")
+                    if "id" in msg:
+                        ws.send(json.dumps({"ack": msg["id"]}))
+        except Exception as exc:  # server not up yet, or dropped: retry
+            print(f"  [ws] {exc}; retrying in 3 s")
+            stop.wait(3)
 
 
 def run_scenario(dev: Device, name: str, count: int, interval: float) -> None:
@@ -202,9 +230,14 @@ def main() -> None:
     if not a.token:
         sys.exit("no device token: run `python dev_seed.py` in server/ or pass --token")
     dev = Device(a.base, a.token, a.device, a.room)
+    stop = threading.Event()
+    threading.Thread(target=command_listener, args=(a.base, a.token, stop), daemon=True).start()
     if a.selftest:
-        sys.exit(selftest(dev))
+        code = selftest(dev)
+        stop.set()
+        sys.exit(code)
     run_scenario(dev, a.scenario, a.count, a.interval)
+    stop.set()
 
 
 if __name__ == "__main__":
