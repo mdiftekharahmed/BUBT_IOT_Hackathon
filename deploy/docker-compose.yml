@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fastrobox
+      POSTGRES_DB: fastrobox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in deploy/.env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastrobox"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ../server
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://fastrobox:${POSTGRES_PASSWORD}@postgres:5432/fastrobox
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  web:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    ports: ["80:80"]
+    depends_on: [api]
+
+volumes:
+  pgdata:
