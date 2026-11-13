@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir .
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
+COPY seed.py ./
 RUN useradd --create-home appuser
 USER appuser
 EXPOSE 8000
