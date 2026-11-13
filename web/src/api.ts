@@ -73,7 +73,14 @@ export type RoomHealth = {
 export type ActiveAlert = { room_id: string; kind: "FIRE" | "PANIC"; since: string };
 export type LoginAttempt = { at: string; username: string; success: boolean };
 
+export type StudentInfo = { id: number; name: string };
+export type AttendanceRow = { date: string; status: string; entry_time: string | null };
+export type StudentAttendance = { student_id: number; attendance: AttendanceRow[] };
+
 export const me = (): Promise<Me> => getJson("/api/auth/me") as Promise<Me>;
+export const listStudents = (): Promise<StudentInfo[]> => getJson("/api/students") as Promise<StudentInfo[]>;
+export const studentAttendance = (id: string): Promise<StudentAttendance> =>
+  getJson(`/api/students/${id}/attendance`) as Promise<StudentAttendance>;
 export const listRooms = (): Promise<RoomInfo[]> => getJson("/api/rooms") as Promise<RoomInfo[]>;
 export const roomState = (id: string): Promise<RoomState> =>
   getJson(`/api/rooms/${id}/state`) as Promise<RoomState>;

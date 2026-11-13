@@ -8,6 +8,19 @@ from app.security import current_user
 router = APIRouter(prefix="/api/students", tags=["students"])
 
 
+@router.get("")
+def list_students(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Students this user may see: own (Student), linked children (Guardian), all (Teacher, Admin)."""
+    query = db.query(Student)
+    if user.role == "student":
+        query = query.filter(Student.user_id == user.id)
+    elif user.role == "guardian":
+        query = query.join(GuardianLink, GuardianLink.student_id == Student.id).filter(
+            GuardianLink.guardian_user_id == user.id
+        )
+    return [{"id": s.id, "name": s.name} for s in query.order_by(Student.id).all()]
+
+
 @router.get("/{student_id}/attendance")
 def attendance(
     student_id: int,
