@@ -52,9 +52,10 @@
 #define PERIOD_RFID_MS      200
 #define PERIOD_DHT_S        5
 #define PERIOD_STATUS_MS    1000
-#define PERIOD_LED_MS       250     // 250 on / 250 off = 2 Hz
+#define PERIOD_LED_MS        50
 #define PERIOD_CONTROL_MS   100
 #define PERIOD_SERIAL_MS    20
+#define PERIOD_TOUCH_MS      20
 
 #define WDT_TIMEOUT_MS      5000    // frozen task -> restart well inside 10 s
 
@@ -62,6 +63,10 @@
 #define RFID_OKS_FOR_CLEAR     3
 #define DHT_FAILS_FOR_ERROR    2    // worst case ~10 s     (limit 12 s)
 #define CARD_GONE_MS         600    // card must be away this long to count a new tap
+#define FIRE_HOLD_MS        2000
+#define PANIC_HOLD_MS       2000
+#define PANIC_DURATION_MS  10000
+#define MAX_TEACHER_TAGS       8
 
 // ============================================================================
 //  SmartClass — FastRobox 1.0 — Level 1
@@ -69,14 +74,24 @@
 //  Board: ESP32-S3-CAM   Library: MFRC522 (GithubCommunity)
 // ============================================================================
 #include <Arduino.h>
+#include <ctype.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <Preferences.h>
 #include <stdarg.h>
 #include "esp_arduino_version.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "src/core/heat.h"
+#include "src/core/status_machine.h"
+
+using fastrobox::HeatStatus;
+using fastrobox::Readings;
+using fastrobox::StatusMachine;
+using fastrobox::Trend;
+using fastrobox::TrendWindow;
 
 // ============================================================================
 //  Shared device state (guarded by a spinlock — copy in/out only)
@@ -84,21 +99,33 @@
 struct DeviceState {
   float tempC = NAN;
   float rh = NAN;
+  float heatIndexC = NAN;
   bool  flame = false;
   bool  doorUnlocked = false;
   bool  dhtError = false;
   bool  rfidError = false;
+  bool  qualityGood = false;
+  bool  fireLatched = false;
+  bool  fireSilenced = false;
+  bool  fireActive = false;
+  bool  panicActive = false;
+  HeatStatus heatStatus = HeatStatus::Safe;
+  Trend trend = Trend::Stable;
+  uint32_t panicAtMs = 0;
   char  lastUid[32] = "";
 };
 
 static DeviceState       g;
 static portMUX_TYPE      gMux = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t gLogMtx;
+static SemaphoreHandle_t gNvsMtx;
 
 static const char*       gResetReason = "POWER_ON";
 static volatile bool     gHangRequested = false;
-static volatile uint32_t gLedColor = 0;      // 0xRRGGBB, chosen by controlTask
 static volatile float    gChipTemp = NAN;    // refreshed every second
+static float             gTouchBaseline = 0;
+static volatile bool     gTeacherEnrollRequested = false;
+static volatile uint32_t gTeacherEnrollUntilMs = 0;
 
 // Survives a software / watchdog reset (not a power cut)
 RTC_NOINIT_ATTR static uint32_t gWdtFiredMagic;
@@ -111,6 +138,10 @@ static DeviceState snapshot() {
 }
 #define STATE_SET(stmt) do { portENTER_CRITICAL(&gMux); stmt; portEXIT_CRITICAL(&gMux); } while (0)
 
+static const char* visibleStatus(const DeviceState& s) {
+  return s.fireLatched ? "FIRE" : fastrobox::statusName(s.heatStatus);
+}
+
 // ============================================================================
 //  Logging — one whole line at a time, never interleaved between tasks
 // ============================================================================
@@ -120,6 +151,115 @@ static void logLine(const char* fmt, ...) {
   bool locked = gLogMtx && xSemaphoreTake(gLogMtx, pdMS_TO_TICKS(50)) == pdTRUE;
   Serial.println(buf);
   if (locked) xSemaphoreGive(gLogMtx);
+}
+
+static bool storeFireLatch(bool latched) {
+  if (!gNvsMtx || xSemaphoreTake(gNvsMtx, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+  Preferences prefs;
+  bool ok = prefs.begin("fastrobox", false);
+  if (ok) {
+    ok = prefs.putBool("fire_latched", latched) == 1;
+    prefs.end();
+  }
+  xSemaphoreGive(gNvsMtx);
+  return ok;
+}
+
+static bool loadFireLatch(bool& latched) {
+  if (!gNvsMtx || xSemaphoreTake(gNvsMtx, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+  Preferences prefs;
+  bool ok = prefs.begin("fastrobox", true);
+  if (ok) {
+    latched = prefs.getBool("fire_latched", false);
+    prefs.end();
+  }
+  xSemaphoreGive(gNvsMtx);
+  return ok;
+}
+
+static bool normalizeUid(const char* input, char* output, size_t outputSize) {
+  size_t digits = 0;
+  if (outputSize < 3) return false;
+  for (const char* p = input; *p; ++p) {
+    if (*p == ':' || *p == '-' || *p == ' ' || *p == '\t') continue;
+    char c = (char)toupper((unsigned char)*p);
+    if (!isxdigit((unsigned char)c) || digits >= 20) return false;
+    if (digits > 0 && digits % 2 == 0) {
+      if (digits / 2 * 3 + 1 >= outputSize) return false;
+      output[digits / 2 * 3 - 1] = ':';
+    }
+    size_t pos = digits / 2 * 3 + (digits % 2);
+    if (pos + 1 >= outputSize) return false;
+    output[pos] = c;
+    ++digits;
+  }
+  if (digits < 8 || digits % 2 != 0) return false;
+  size_t length = digits + digits / 2 - 1;
+  output[length] = 0;
+  return true;
+}
+
+static bool teacherTagExists(const char* uid, bool& found) {
+  found = false;
+  if (!gNvsMtx || xSemaphoreTake(gNvsMtx, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+  Preferences prefs;
+  bool ok = prefs.begin("fastrobox", true);
+  if (ok) {
+    for (uint8_t i = 0; i < MAX_TEACHER_TAGS; ++i) {
+      char key[12];
+      snprintf(key, sizeof key, "teacher%u", (unsigned)i);
+      if (prefs.getString(key, "") == uid) {
+        found = true;
+        break;
+      }
+    }
+    prefs.end();
+  }
+  xSemaphoreGive(gNvsMtx);
+  return ok;
+}
+
+static bool addTeacherTag(const char* uid) {
+  if (!gNvsMtx || xSemaphoreTake(gNvsMtx, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+  Preferences prefs;
+  bool added = false;
+  if (prefs.begin("fastrobox", false)) {
+    for (uint8_t i = 0; i < MAX_TEACHER_TAGS; ++i) {
+      char key[12];
+      snprintf(key, sizeof key, "teacher%u", (unsigned)i);
+      String existing = prefs.getString(key, "");
+      if (existing == uid) {
+        added = true;
+        break;
+      }
+      if (!existing.length()) {
+        added = prefs.putString(key, uid) > 0;
+        break;
+      }
+    }
+    prefs.end();
+  }
+  xSemaphoreGive(gNvsMtx);
+  return added;
+}
+
+static bool resetFireLatch() {
+  DeviceState s = snapshot();
+  if (!s.fireLatched) {
+    logLine("[CMD] reset_fire: no fire latch is active");
+    return true;
+  }
+  if (s.flame) {
+    logLine("[ERROR] CANNOT RESET FIRE - FLAME PRESENT");
+    return false;
+  }
+  if (!storeFireLatch(false)) {
+    logLine("[ERROR] FIRE LATCH RESET NOT SAVED");
+    return false;
+  }
+  STATE_SET({ g.fireLatched = false; g.fireSilenced = false; g.doorUnlocked = false; });
+  logLine("[CMD] fire latch reset");
+  return true;
 }
 
 // ============================================================================
@@ -277,21 +417,22 @@ static bool rfidReadCard(char* out, size_t n) {
 }
 
 // ============================================================================
-//  Status line (fixed format, fields of later levels printed as "-")
+// Status line (fixed format)
 // ============================================================================
 static void printStatusLine() {
   DeviceState s = snapshot();
-  char t[12], rh[12], chip[12];
+  char t[12], rh[12], hi[12], chip[12];
   if (isnan(s.tempC)) strcpy(t, "-");  else snprintf(t, sizeof t, "%.1fC", s.tempC);
   if (isnan(s.rh))    strcpy(rh, "-"); else snprintf(rh, sizeof rh, "%.0f%%", s.rh);
+  if (isnan(s.heatIndexC)) strcpy(hi, "-"); else snprintf(hi, sizeof hi, "%.1fC", s.heatIndexC);
   float ct = gChipTemp;
   if (isnan(ct))      strcpy(chip, "-"); else snprintf(chip, sizeof chip, "%.1fC", ct);
-  logLine("[STATUS] up=%lus T=%s RH=%s HI=- flame=%d door=%s state=SAFE trend=- rssi=- "
-          "heap=%luk psram=%luk chip=%s fw=%s",
-          (unsigned long)(esp_timer_get_time() / 1000000ULL), t, rh, s.flame ? 1 : 0,
-          s.doorUnlocked ? "UNLOCKED" : "LOCKED",
+  logLine("[STATUS] up=%lus T=%s RH=%s HI=%s flame=%d door=%s state=%s trend=%s rssi=- "
+          "heap=%luk psram=%luk chip=%s fw=%s quality=%s",
+          (unsigned long)(esp_timer_get_time() / 1000000ULL), t, rh, hi, s.flame ? 1 : 0,
+          s.doorUnlocked ? "UNLOCKED" : "LOCKED", visibleStatus(s), fastrobox::trendName(s.trend),
           (unsigned long)(ESP.getFreeHeap() / 1024), (unsigned long)(ESP.getFreePsram() / 1024),
-          chip, FW_VERSION);
+          chip, FW_VERSION, s.qualityGood ? "good" : "bad");
 }
 
 // ============================================================================
@@ -337,8 +478,7 @@ static void rfidTask(void*) {
           if (!onReader || strcmp(uid, cur) != 0) {     // new tap
             onReader = true;
             strlcpy(cur, uid, sizeof cur);
-            STATE_SET(strlcpy(g.lastUid, uid, sizeof g.lastUid));
-            logLine("[CARD] uid=%s", uid);
+            handleCardTap(uid);
           }
         } else if (onReader && millis() - lastSeen > CARD_GONE_MS) {
           onReader = false;                      // card removed -> next tap counts
@@ -363,14 +503,22 @@ static void dhtTask(void*) {
   int tick = PERIOD_DHT_S - 2;           // first read ~2 s after boot
   uint8_t fails = 0;
   bool err = false;
+  TrendWindow temperatures;
   for (;;) {
     wdtFeed();
     if (++tick >= PERIOD_DHT_S) {
       tick = 0;
       float t, h;
-      if (dht11Read(t, h)) {
+      if (dht11Read(t, h) && t >= 0.0f && t <= 50.0f && h >= 20.0f && h <= 90.0f) {
         fails = 0;
-        STATE_SET({ g.tempC = t; g.rh = h; });
+        temperatures.add(t);
+        STATE_SET({
+          g.tempC = t;
+          g.rh = h;
+          g.heatIndexC = fastrobox::heatIndexC(t, h);
+          g.trend = temperatures.trend();
+          g.qualityGood = true;
+        });
         if (err) {
           err = false;
           STATE_SET(g.dhtError = false);
@@ -378,6 +526,12 @@ static void dhtTask(void*) {
         }
       } else {
         if (fails < 255) fails++;
+        STATE_SET({
+          g.tempC = NAN;
+          g.rh = NAN;
+          g.heatIndexC = NAN;
+          g.qualityGood = false;
+        });
         if (!err && fails >= DHT_FAILS_FOR_ERROR) {
           err = true;
           STATE_SET(g.dhtError = true);
@@ -394,32 +548,161 @@ static void dhtTask(void*) {
 static void controlTask(void*) {
   wdtAdd();
   TickType_t last = xTaskGetTickCount();
+  StatusMachine statusMachine;
+  bool flameTiming = false;
+  uint32_t flameStartedAt = 0;
   for (;;) {
     if (gHangRequested) {
       logLine("[CMD] main task frozen - watchdog must restart the board within 10 s");
       volatile uint32_t spin = 0;
       for (;;) { spin++; }                      // stuck, never feeds the watchdog
     }
-    DeviceState s = snapshot();
-    // Device Signals priority (lower number wins). Level 1 has: 6 Sensor error, 11 Safe.
-    uint32_t c = COLOR_GREEN;
-    if (s.dhtError || s.rfidError) c = COLOR_MAGENTA;
-    gLedColor = c;
+    DeviceState before = snapshot();
+    char oldStatus[12];
+    strlcpy(oldStatus, visibleStatus(before), sizeof oldStatus);
+    uint32_t now = millis();
+    if (before.flame) {
+      if (!flameTiming) {
+        flameTiming = true;
+        flameStartedAt = now;
+      } else if (!before.fireActive &&
+                 static_cast<uint32_t>(now - flameStartedAt) >= FIRE_HOLD_MS) {
+        if (!before.fireLatched && !storeFireLatch(true))
+          logLine("[ERROR] FIRE LATCH SAVE FAILED");
+        STATE_SET({
+          g.fireLatched = true;
+          g.fireSilenced = false;
+          g.fireActive = true;
+          g.doorUnlocked = true;
+        });
+        logLine("[EVENT] FIRE flame held for 2s");
+      }
+    } else {
+      flameTiming = false;
+      if (before.fireActive) {
+        STATE_SET(g.fireActive = false);
+        logLine("[EVENT] FIRE_CLEARED");
+      }
+    }
+
+    before = snapshot();
+    HeatStatus next = statusMachine.update(
+        {before.tempC, before.rh, before.qualityGood}, now);
+    STATE_SET(g.heatStatus = next);
+    if (before.panicActive &&
+        static_cast<uint32_t>(now - before.panicAtMs) >= PANIC_DURATION_MS)
+      STATE_SET(g.panicActive = false);
+    DeviceState after = snapshot();
+    if (strcmp(oldStatus, visibleStatus(after)) != 0)
+      logLine("[EVENT] STATUS %s->%s", oldStatus, visibleStatus(after));
     wdtFeed();
     vTaskDelayUntil(&last, pdMS_TO_TICKS(PERIOD_CONTROL_MS));
   }
 }
 
-// ---- Core 0: LED heartbeat, 250 ms on / 250 ms off --------------------------
+// ---- Core 0: light and buzzer signals -------------------------------------
 static void ledTask(void*) {
   wdtAdd();
   TickType_t last = xTaskGetTickCount();
-  bool on = false;
   for (;;) {
-    on = !on;
-    rgbWrite(on ? gLedColor : 0);
+    DeviceState s = snapshot();
+    uint32_t now = millis();
+    uint32_t color = COLOR_GREEN;
+    uint32_t phaseMs = 500;
+    bool ledOn = (now % phaseMs) < phaseMs / 2;
+    bool buzzerOn = false;
+    bool panicActive = s.panicActive &&
+        static_cast<uint32_t>(now - s.panicAtMs) < PANIC_DURATION_MS;
+
+    if (s.fireLatched) {
+      color = COLOR_RED;
+      phaseMs = 400;
+      ledOn = (now % phaseMs) < 200;
+      buzzerOn = !s.fireSilenced && (now % phaseMs) < 200;
+    } else if (panicActive) {
+      uint32_t panicPhase = now % 400;
+      color = (panicPhase < 200) ? COLOR_RED : COLOR_BLUE;
+      ledOn = (panicPhase % 200) < 100;
+      buzzerOn = (panicPhase % 200) < 100;
+    } else if (s.heatStatus == HeatStatus::Danger) {
+      color = COLOR_RED;
+      buzzerOn = (now % 2000) < 100;
+    } else if (s.dhtError || s.rfidError) {
+      color = COLOR_MAGENTA;
+    } else if (s.heatStatus == HeatStatus::Warning) {
+      color = COLOR_YELLOW;
+    }
+
+    rgbWrite(ledOn ? color : 0);
+    digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
     wdtFeed();
     vTaskDelayUntil(&last, pdMS_TO_TICKS(PERIOD_LED_MS));
+  }
+}
+
+static void touchTask(void*) {
+  wdtAdd();
+  TickType_t last = xTaskGetTickCount();
+  bool touching = false;
+  bool panicRaised = false;
+  uint32_t touchStartedAt = 0;
+  for (;;) {
+    uint32_t now = millis();
+    uint16_t value = touchRead(PIN_TOUCH);
+    bool active = gTouchBaseline > 0 && value < gTouchBaseline * 0.70f;
+    if (active) {
+      if (!touching) {
+        touching = true;
+        panicRaised = false;
+        touchStartedAt = now;
+      } else if (!panicRaised &&
+                 static_cast<uint32_t>(now - touchStartedAt) >= PANIC_HOLD_MS) {
+        STATE_SET({ g.panicActive = true; g.panicAtMs = now; });
+        panicRaised = true;
+        logLine("[EVENT] PANIC touch held for 2s");
+      }
+    } else {
+      touching = false;
+      panicRaised = false;
+    }
+    wdtFeed();
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(PERIOD_TOUCH_MS));
+  }
+}
+
+static bool consumeTeacherEnrollRequest() {
+  bool requested;
+  portENTER_CRITICAL(&gMux);
+  requested = gTeacherEnrollRequested &&
+      static_cast<int32_t>(gTeacherEnrollUntilMs - millis()) > 0;
+  gTeacherEnrollRequested = false;
+  gTeacherEnrollUntilMs = 0;
+  portEXIT_CRITICAL(&gMux);
+  return requested;
+}
+
+static void handleCardTap(const char* uid) {
+  STATE_SET(strlcpy(g.lastUid, uid, sizeof g.lastUid));
+  logLine("[CARD] uid=%s", uid);
+  if (consumeTeacherEnrollRequest()) {
+    if (addTeacherTag(uid)) logLine("[EVENT] TEACHER_TAG_ADDED uid=%s", uid);
+    else logLine("[ERROR] TEACHER TAG LIST FULL OR NVS WRITE FAILED");
+    return;
+  }
+  bool teacher = false;
+  if (!teacherTagExists(uid, teacher)) {
+    logLine("[ERROR] TEACHER TAG STORAGE READ FAILED");
+    return;
+  }
+  if (!teacher) return;
+
+  DeviceState s = snapshot();
+  if (!s.fireLatched) return;
+  if (s.flame) {
+    logLine("[ERROR] CANNOT SILENCE - FLAME PRESENT");
+  } else if (!s.fireSilenced) {
+    STATE_SET(g.fireSilenced = true);
+    logLine("[EVENT] SILENCED");
   }
 }
 
@@ -444,8 +727,37 @@ static void cmdHelp() {
   logLine("[CMD]   tasks   - each task with its core and free stack");
   logLine("[CMD]   ver     - firmware version and build date");
   logLine("[CMD]   hang    - freeze the main task (watchdog test)");
+  logLine("[CMD]   teacher enroll - register the next RFID tag as a Teacher tag");
+  logLine("[CMD]   teacher add <uid> | teacher list");
+  logLine("[CMD]   reset_fire - clear the fire latch when no flame is present");
   logLine("[CMD]   reset   - clear Wi-Fi details, restart in setup mode (Level 2)");
   logLine("[CMD]   csi     - Wi-Fi CSI rate, subcarriers, channel (Level 11)");
+}
+
+static void cmdTeacherList() {
+  if (!gNvsMtx || xSemaphoreTake(gNvsMtx, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    logLine("[ERROR] TEACHER TAG STORAGE BUSY");
+    return;
+  }
+  Preferences prefs;
+  if (!prefs.begin("fastrobox", true)) {
+    xSemaphoreGive(gNvsMtx);
+    logLine("[ERROR] TEACHER TAG STORAGE UNAVAILABLE");
+    return;
+  }
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < MAX_TEACHER_TAGS; ++i) {
+    char key[12];
+    snprintf(key, sizeof key, "teacher%u", (unsigned)i);
+    String uid = prefs.getString(key, "");
+    if (uid.length()) {
+      logLine("[CMD] teacher_tag=%s", uid.c_str());
+      ++count;
+    }
+  }
+  prefs.end();
+  xSemaphoreGive(gNvsMtx);
+  if (!count) logLine("[CMD] no Teacher tags registered");
 }
 
 static void cmdHealth() {
@@ -487,6 +799,24 @@ static void handleCommand(char* line) {
   else if (!strcmp(line, "tasks"))  cmdTasks();
   else if (!strcmp(line, "ver"))    logLine("[CMD] fw=%s build=%s %s device=%s", FW_VERSION, __DATE__, __TIME__, DEVICE_ID);
   else if (!strcmp(line, "hang"))   { logLine("[CMD] hang: freezing main task"); gHangRequested = true; }
+  else if (!strcmp(line, "teacher enroll")) {
+    STATE_SET({
+      gTeacherEnrollRequested = true;
+      gTeacherEnrollUntilMs = millis() + 30000U;
+    });
+    logLine("[CMD] tap the Teacher key tag within 30 seconds");
+  }
+  else if (!strcmp(line, "teacher list")) cmdTeacherList();
+  else if (!strncmp(line, "teacher add ", 12)) {
+    char uid[32];
+    if (!normalizeUid(line + 12, uid, sizeof uid))
+      logLine("[ERROR] INVALID TEACHER TAG UID");
+    else if (addTeacherTag(uid))
+      logLine("[CMD] Teacher tag registered: %s", uid);
+    else
+      logLine("[ERROR] TEACHER TAG LIST FULL OR NVS WRITE FAILED");
+  }
+  else if (!strcmp(line, "reset_fire")) resetFireLatch();
   else if (!strcmp(line, "reset"))  logLine("[CMD] reset: available from Level 2");
   else if (!strcmp(line, "csi"))    logLine("[CMD] csi: available from Level 11");
   else                              logLine("[CMD] unknown command '%s' - type help", line);
@@ -539,8 +869,12 @@ void setup() {
   int votes = 0;
   for (int i = 0; i < 5; i++) { if (readFlameRaw()) votes++; delay(5); }
   bool flameAtBoot = votes >= 3;
+  gNvsMtx = xSemaphoreCreateMutex();
+  bool fireLatchStored = false;
+  bool fireLatchReadOk = loadFireLatch(fireLatchStored);
   g.flame = flameAtBoot;
-  g.doorUnlocked = flameAtBoot;                 // flame -> UNLOCKED, none -> LOCKED
+  g.fireLatched = !fireLatchReadOk || fireLatchStored;
+  g.doorUnlocked = flameAtBoot || g.fireLatched;
 
   // --- serial + logging ---
   gLogMtx = xSemaphoreCreateMutex();
@@ -556,12 +890,21 @@ void setup() {
   gWdtFiredMagic = 0;
 
   logLine("[EVENT] BOOT reason=%s", gResetReason);
-  logLine("[EVENT] DOOR %s (start-up flame check: %s)",
-          flameAtBoot ? "UNLOCKED" : "LOCKED", flameAtBoot ? "flame" : "no flame");
+  if (!fireLatchReadOk) logLine("[ERROR] FIRE LATCH NVS READ FAILED");
+  logLine("[EVENT] DOOR %s (startup flame=%s fire_latched=%s)",
+          g.doorUnlocked ? "UNLOCKED" : "LOCKED", flameAtBoot ? "yes" : "no",
+          g.fireLatched ? "yes" : "no");
   logLine("[CMD] SmartClass %s fw=%s - type help", DEVICE_ID, FW_VERSION);
+  uint32_t touchTotal = 0;
+  for (uint8_t i = 0; i < 32; ++i) {
+    touchTotal += touchRead(PIN_TOUCH);
+    delay(10);
+  }
+  gTouchBaseline = touchTotal / 32.0f;
+  logLine("[EVENT] TOUCH_BASELINE value=%.1f threshold=%.1f",
+          gTouchBaseline, gTouchBaseline * 0.70f);
 
   // --- LED ---
-  gLedColor = COLOR_GREEN;
   rgbWrite(0);
 
   // --- RC522 ---
@@ -577,6 +920,7 @@ void setup() {
   startTask(rfidTask,    "rfid",    4096, 2,   1,   PERIOD_RFID_MS);
   startTask(dhtTask,     "dht11",   3072, 2,   1,   PERIOD_DHT_S * 1000);
   startTask(ledTask,     "led",     3072, 3,   0,   PERIOD_LED_MS);
+  startTask(touchTask,   "touch",   3072, 2,   0,   PERIOD_TOUCH_MS);
   startTask(statusTask,  "status",  4096, 2,   0,   PERIOD_STATUS_MS);
   startTask(serialTask,  "serial",  4096, 1,   0,   PERIOD_SERIAL_MS);
 }

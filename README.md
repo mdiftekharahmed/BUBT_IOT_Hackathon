@@ -48,7 +48,7 @@ docker compose up -d --build
 docker compose exec api python -m seed     # judges' accounts; prints the DEVICE_TOKEN once
 ```
 
-Then open `http://localhost:8080` (port from compose). For a public HTTPS demo,
+Then open `http://localhost` (port 80 from compose). For a public HTTPS demo,
 expose the VM with `tailscale funnel --bg 443`.
 
 ## Judges' accounts (`python -m seed`)
