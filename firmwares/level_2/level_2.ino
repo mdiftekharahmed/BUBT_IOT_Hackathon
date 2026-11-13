@@ -19,7 +19,7 @@
 // Platform address. Public, NOT a secret — the device token is typed on the setup page.
 // For the judged run this MUST be the public https:// address (certificate is checked).
 // An http:// address switches to TEST MODE: plain HTTP on the local network, no certificate.
-#define SERVER_BASE  "http://192.168.68.59:8010"    // <-- TEST MODE: this PC on the same Wi-Fi
+#define SERVER_BASE  "https://coldchain.durnibar.tech"   // public HTTPS address (Let's Encrypt)
 
 #define AP_SSID      "SmartClass-" TEAM_ID
 #define MDNS_HOST    "smartclass-t17"               // http://smartclass-t17.local
