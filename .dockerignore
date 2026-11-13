@@ -1,0 +1,4 @@
+# applies to repository-root build contexts (the web image)
+.git
+web/node_modules
+web/dist
