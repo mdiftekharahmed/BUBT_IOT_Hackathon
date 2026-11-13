@@ -8,3 +8,5 @@ node_modules/
 dist/
 server/training/datasets/
 .dev/
+server/fastrobox_server.egg-info/
+.testdb/
