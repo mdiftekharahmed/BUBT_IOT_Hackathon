@@ -214,7 +214,7 @@ static NetConfig         gPending;             // filled by the setup page
 static volatile bool     gSetupSubmitted = false;
 static volatile NetState gNet = NET_SETUP;
 static char              gApPass[9] = "";
-static char              gSetupError[64] = "";
+static char              gSetupError[112] = "";
 static char              gIp[16] = "";
 static volatile bool     gApUp = false;
 static String            gScanJson = "{\"networks\":[]}";   // guarded by gScanMtx
@@ -1191,10 +1191,10 @@ static void handleSetupState() {
   NetConfig c = cfgCopy();
   const char* st = gNet == NET_CONNECTED ? "CONNECTED" : gNet == NET_SETUP ? "SETUP" : "CONNECTING";
   if (gSetupSubmitted) st = "CONNECTING";
-  char ssid[80], err[100];
+  char ssid[80], err[240];
   jsonStr(ssid, sizeof ssid, c.ssid);
   jsonStr(err, sizeof err, gSetupError);
-  char buf[256];
+  char buf[480];
   snprintf(buf, sizeof buf, "{\"state\":\"%s\",\"ssid\":%s,\"error\":%s,\"ip\":\"%s\"}", st, ssid, err, gIp);
   sendJson(200, buf);
 }
