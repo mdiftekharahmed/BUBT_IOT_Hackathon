@@ -1,4 +1,4 @@
-"""Background jobs: offline sweep now, phone alerts in Task 9.  Run: python -m app.worker"""
+"""Background jobs: offline sweep and Telegram alerts.  Run: python -m app.worker"""
 import logging
 import time
 from datetime import timedelta
@@ -7,12 +7,15 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.clock import Clock, SystemClock
+from app.config import settings
 from app.models import Device
+from app.services.alerts import TelegramSender, dispatch_alerts
 from app.services.live import notify
 
 log = logging.getLogger("worker")
 OFFLINE_AFTER_S = 30
-LOOP_EVERY_S = 5
+TICK_S = 1  # alert budget is 10 s; the worker must look for new events every second
+SWEEP_EVERY_TICKS = 5  # offline sweep keeps the old 5 s cadence
 
 
 def sweep_offline(db: Session, clock: Clock, limit_s: int = OFFLINE_AFTER_S, notifier=notify) -> list[str]:
@@ -34,17 +37,27 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
     clock = SystemClock()
+    sender = TelegramSender(settings.telegram_bot_token) if settings.telegram_bot_token else None
+    if sender is None:
+        log.warning("TELEGRAM_BOT_TOKEN not set; alerts are disabled")
     log.info("worker started")
+    tick = 0
     while True:
         try:
             with SessionLocal() as db:
-                gone = sweep_offline(db, clock)
+                if tick % SWEEP_EVERY_TICKS == 0:
+                    gone = sweep_offline(db, clock)
+                    if gone:
+                        log.info("offline: %s", ", ".join(gone))
+                if sender is not None:
+                    sent = dispatch_alerts(db, sender, clock)
+                    if sent:
+                        log.info("alerts sent: %s", ", ".join(sent))
                 db.commit()
-            if gone:
-                log.info("offline: %s", ", ".join(gone))
         except Exception:  # keep the loop alive; the next pass retries
-            log.exception("sweep failed")
-        time.sleep(LOOP_EVERY_S)
+            log.exception("worker tick failed")
+        tick += 1
+        time.sleep(TICK_S)
 
 
 if __name__ == "__main__":
