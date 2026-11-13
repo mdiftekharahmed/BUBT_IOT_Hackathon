@@ -292,6 +292,7 @@ static void watchdogInit() {
 #endif
 }
 static inline void wdtAdd()  { esp_task_wdt_add(NULL); }
+static inline void wdtDel()  { esp_task_wdt_delete(NULL); }
 static inline void wdtFeed() { esp_task_wdt_reset(); }
 
 static const char* resetReasonText(esp_reset_reason_t r) {
@@ -599,6 +600,7 @@ static uint16_t gDiscAtTry = 0;
 static uint32_t gScanAtMs = 0;
 static bool     gConnPending = false;   // a WiFi.begin() is due (waits for a running scan to finish)
 static uint8_t  gFatalCount = 0;        // "wrong password / not found" results in a row
+static bool     gSeenLogged = false;    // the "is the network visible" scan runs once per connect
 
 static volatile uint8_t gLastEvent = 0;   // last Wi-Fi driver event id (diagnostics)
 
@@ -613,7 +615,9 @@ static void onWifiDisconnected(WiFiEvent_t, WiFiEventInfo_t info) {
 
 // Is the saved network actually visible from here? (2.4 GHz only; a 5 GHz hotspot is invisible)
 static void logSeenNetwork(const char* ssid) {
+  wdtDel();                                 // a blocking scan can take seconds; do not trip the 5 s watchdog
   int n = WiFi.scanNetworks(false, true);   // blocking, includes hidden networks
+  wdtAdd();
   bool seen = false;
   for (int i = 0; i < n; i++) {
     if (WiFi.SSID(i) == ssid) {
@@ -644,8 +648,10 @@ static void makeApPassword(char out[9]) {
 
 static void enterSetup() {
   if (!gApPass[0]) makeApPassword(gApPass);      // one password per start-up
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, gApPass);
+  if (!(gApUp && WiFi.getMode() == WIFI_AP_STA)) {   // already up (after a failed attempt): keep it, do not kick the laptop
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, gApPass);
+  }
   gApUp = true;
   gApOffAtMs = 0;
   gScanAtMs = 0;
@@ -658,6 +664,7 @@ static void enterSetup() {
 static void startConnect(const NetConfig& c) {
   gLastDiscReason = 0;
   gFatalCount = 0;
+  gSeenLogged = false;
   gConnPending = true;
   gConnectStartMs = millis();
   gNet = NET_CONNECTING;
@@ -765,7 +772,7 @@ static void netTask(void*) {
           if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
             WiFi.scanDelete();
             gDiscAtTry = gDiscCount;
-            logSeenNetwork(c.ssid);
+            if (!gSeenLogged) { gSeenLogged = true; logSeenNetwork(c.ssid); }
             logLine("[NET] join attempt: wifi mode=%d, password %s (%d characters)", (int)WiFi.getMode(),
                     c.pass[0] ? "given" : "empty", (int)strlen(c.pass));
             WiFi.begin(c.ssid, c.pass[0] ? c.pass : nullptr);
@@ -944,6 +951,7 @@ static void cloudTask(void*) {
       }
       if (n == 0) kind = r.kind; else if (r.kind != kind) break;
       size_t l = recordJson(r, c.room, one, sizeof one);
+      if (l >= sizeof one) l = sizeof one - 1;                 // never copy past the scratch buffer
       if (len + l + 2 >= sizeof body) break;
       body[len++] = n == 0 ? '[' : ',';
       memcpy(body + len, one, l); len += l;
@@ -977,11 +985,14 @@ static void cloudTask(void*) {
       serverResult(true, "");
       tokenWarned = false;
     } else if (code == 401) {
-      serverResult(true, "");          // the server answered; the token is the problem
+      serverResult(false, "device token refused (HTTP 401)");   // not LIVE: nothing is being stored
       if (!tokenWarned) { logLine("[NET] server refused the device token (401) - check the token on the setup page"); tokenWarned = true; }
       vTaskDelay(pdMS_TO_TICKS(5000));
     } else {
-      serverResult(false, resp.c_str());
+      char why[96];
+      if (code > 0) snprintf(why, sizeof why, "HTTP %d from the server side (backend down?)", code);
+      else snprintf(why, sizeof why, "%s", resp.substring(0, 80).c_str());
+      serverResult(false, why);
       tls.stop();
       plainClient.stop();
       vTaskDelay(pdMS_TO_TICKS(2000));
