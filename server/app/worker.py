@@ -13,9 +13,9 @@ from app.services.alerts import TelegramSender, dispatch_alerts
 from app.services.live import notify
 
 log = logging.getLogger("worker")
-OFFLINE_AFTER_S = 30
+OFFLINE_AFTER_S = 20  # limit is 30 s; 20 s tolerates three missed 5 s records and leaves margin
 TICK_S = 1  # alert budget is 10 s; the worker must look for new events every second
-SWEEP_EVERY_TICKS = 5  # offline sweep keeps the old 5 s cadence
+SWEEP_EVERY_TICKS = 1  # sweep every second so the mark lands at 20-21 s of silence
 
 
 def sweep_offline(db: Session, clock: Clock, limit_s: int = OFFLINE_AFTER_S, notifier=notify) -> list[str]:

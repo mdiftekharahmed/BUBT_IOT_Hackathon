@@ -200,8 +200,13 @@ def selftest(dev: Device) -> int:
     r = dev.post("telemetry", bad)
     check("missing field refused (422) naming it", r.status_code == 422 and "status" in r.text, str(r.status_code))
 
+    # The judge types the Room ID on the device: a new one is accepted and the device moves.
     r = dev.post("telemetry", dev.telemetry(29.0, room_id="R-999"))
-    check("wrong room refused (422)", r.status_code == 422, str(r.status_code))
+    check("new Room ID accepted (200)", r.status_code == 200, str(r.status_code))
+    r = dev.post("telemetry", dev.telemetry(29.0, room_id="R 9/9"))
+    check("malformed Room ID refused (422)", r.status_code == 422 and "invalid room_id" in r.text, str(r.status_code))
+    r = dev.post("telemetry", dev.telemetry(29.0))
+    check("back to the original room (200)", r.status_code == 200, str(r.status_code))
 
     ev = dev.event("BOOT", "reason=WATCHDOG")
     check("BOOT event stored (200)", dev.post("events", ev).status_code == 200)
