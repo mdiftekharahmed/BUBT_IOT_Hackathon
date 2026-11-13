@@ -600,11 +600,30 @@ static uint32_t gScanAtMs = 0;
 static bool     gConnPending = false;   // a WiFi.begin() is due (waits for a running scan to finish)
 static uint8_t  gFatalCount = 0;        // "wrong password / not found" results in a row
 
+static volatile uint8_t gLastEvent = 0;   // last Wi-Fi driver event id (diagnostics)
+
+static void onWifiEvent(WiFiEvent_t ev, WiFiEventInfo_t) { gLastEvent = (uint8_t)ev; }
+
 static void onWifiDisconnected(WiFiEvent_t, WiFiEventInfo_t info) {
   int r = info.wifi_sta_disconnected.reason;
   if (r == 8) return;                  // ASSOC_LEAVE: we asked for it
   gLastDiscReason = r;
   gDiscCount++;
+}
+
+// Is the saved network actually visible from here? (2.4 GHz only; a 5 GHz hotspot is invisible)
+static void logSeenNetwork(const char* ssid) {
+  int n = WiFi.scanNetworks(false, true);   // blocking, includes hidden networks
+  bool seen = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == ssid) {
+      logLine("[NET] \"%s\" is visible: channel %d, signal %d dBm, %s", ssid, WiFi.channel(i), WiFi.RSSI(i),
+              WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "password-protected");
+      seen = true;
+    }
+  }
+  if (!seen) logLine("[NET] \"%s\" is NOT visible among %d networks (is the hotspot 2.4 GHz, on and close?)", ssid, n);
+  WiFi.scanDelete();
 }
 
 static bool reasonIsFatal(int r) {     // wrong password / network not there
@@ -746,8 +765,11 @@ static void netTask(void*) {
           if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
             WiFi.scanDelete();
             gDiscAtTry = gDiscCount;
+            logSeenNetwork(c.ssid);
+            logLine("[NET] join attempt: wifi mode=%d, password %s (%d characters)", (int)WiFi.getMode(),
+                    c.pass[0] ? "given" : "empty", (int)strlen(c.pass));
             WiFi.begin(c.ssid, c.pass[0] ? c.pass : nullptr);
-            gTryStartMs = now;
+            gTryStartMs = millis();
             gConnPending = false;
           }
         } else if (gDiscCount != gDiscAtTry) {
@@ -758,7 +780,8 @@ static void netTask(void*) {
           logLine("[NET] attempt failed (reason %d), trying again", gLastDiscReason);
           gConnPending = true;
         } else if (now - gTryStartMs > 6000) {
-          logLine("[NET] no answer yet, trying again");
+          logLine("[NET] no answer yet (wifi status=%d, last driver event=%u), trying again", (int)WiFi.status(),
+                  (unsigned)gLastEvent);
           WiFi.disconnect(false);
           gConnPending = true;
         }
@@ -1544,6 +1567,7 @@ void setup() {
   WiFi.persistent(false);              // our own NVS keys hold the details
   WiFi.setAutoReconnect(false);        // we control the retry gaps
   WiFi.onEvent(onWifiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  WiFi.onEvent(onWifiEvent);
   WiFi.setHostname(MDNS_HOST);
   if (haveCfg) {
     WiFi.mode(WIFI_STA);
