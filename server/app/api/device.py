@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+import asyncio
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -7,6 +9,7 @@ from app.db import get_db
 from app.models import Device
 from app.security import token_matches
 from app.services.ingest import IngestResult, validate_and_store
+from app.services.live import hub
 
 router = APIRouter(prefix="/api/device", tags=["device"])
 
@@ -60,3 +63,35 @@ async def telemetry(request: Request, device: Device = Depends(current_device),
 async def events(request: Request, device: Device = Depends(current_device),
                  db: Session = Depends(get_db), clock: Clock = Depends(get_clock)):
     return _ingest("events", await _json(request), device, db, clock)
+
+
+async def _read_acks(ws: WebSocket) -> None:
+    try:
+        while True:
+            data = await ws.receive_json()
+            if isinstance(data, dict) and "ack" in data:
+                hub.record_ack(str(data["ack"]))
+    except Exception:
+        return  # socket closed
+
+
+@router.websocket("/ws")
+async def device_ws(ws: WebSocket, device: Device = Depends(current_device)):
+    """Server-to-device command channel: delivers {"cmd": ..., "id": ...},
+    accepts {"ack": id}. No inbound port on the device."""
+    await ws.accept()
+    queue = hub.add_device(device.id)
+    reader = asyncio.create_task(_read_acks(ws))
+    try:
+        while True:
+            msg = await queue.get()
+            await ws.send_json(msg)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        reader.cancel()
+        hub.remove_device(device.id)
+        try:
+            await ws.close()
+        except Exception:
+            pass

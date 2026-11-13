@@ -15,6 +15,7 @@ from app.security import (
     revoke_session,
 )
 from app.services.lockout import LoginGuard
+from app.services.live import hub
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 _guard = LoginGuard()
@@ -59,6 +60,7 @@ def logout(
     clock: Clock = Depends(get_clock),
 ):
     revoke_session(db, fastrobox_session, clock)
+    hub.session_revoked(fastrobox_session)  # stop live delivery on this session immediately
     db.commit()
     response = Response()
     response.delete_cookie(COOKIE_NAME)
